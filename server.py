@@ -1,187 +1,83 @@
-"""GoAI Moat — AI 可见性 MCP（中文版）
+"""GoAI Moat — AI 可见性 MCP（中文版 · 纯转发薄壳）
 
-多模型 AI 可见性审计：同时问 ChatGPT（消费者版）、Perplexity、Grok 对品牌的真实认知，
-扫描网站 GEO/SEO 健康度，返回 0–100 评分 + 基准分位 + 优先问题清单。
-
-定价：免费 3 次/邮箱；之后 $98/月订阅（每天 10 次、每月 100 次）。
+薄壳：本 MCP 不持任何 API 密钥、不计费、不调 subprocess。
+所有密钥、账户管理、配额与真实多模型测评都在 GoAI Moat 香港服务器上。
+本服务只把调用者身份（api_key / license_key / email）转发到服务器 /api/audit 并回传结果。
 """
 from fastmcp import FastMCP
-import os, json, sys, time
-from pathlib import Path
+import os, json, urllib.request, urllib.error
 
-# 复用核心审计逻辑（同目录 geo_seo_audit.py）
-sys.path.insert(0, str(Path(__file__).parent))
-from geo_seo_audit import scan_site, infer_brand, ai_probe, score_site
-
-QUOTA_DIR = os.environ.get("QUOTA_DIR", "/opt/gg-ai-brief/ai-visibility-cn")
-FREE_LIMIT = 3          # 免费 3 次/邮箱
-DAILY_LIMIT = 10        # 订阅后每天 10 次
-MONTHLY_LIMIT = 100     # 订阅后每月 100 次
-LICENSE_PRICE = "$98/月（每天 10 次、每月 100 次）"
-BUY_LINK = "https://niebingyu.gumroad.com/l/ai-visibility"
+AUDIT_URL = os.environ.get("AUDIT_URL", "http://127.0.0.1:8031")
 
 mcp = FastMCP(
     name="GoAI Moat — AI 可见性",
     instructions=(
-        "任意网站或品牌的 AI 可见性审计（中文版）。同时问 ChatGPT、Perplexity、Grok 对品牌的真实认知，"
-        "扫描网站 GEO/SEO 健康度，返回 0–100 评分 + 基准分位 + 优先问题清单。"
-        "免费 3 次/邮箱；之后 $98/月订阅（每天 10 次、每月 100 次）。"
+        "任意网站或品牌的 AI 可见性审计（中文版）。本服务是纯转发薄壳：密钥与配额判断都在服务器端。"
+        "用 audit_ai_visibility(url, api_key) 做完整审计；check_ai_mentions(brand) 快速查询；"
+        "check_license(license_key) 激活 license 获取 api_key。"
     ),
 )
 
 
-def _quota_file():
-    return Path(QUOTA_DIR) / "quota.json"
-
-
-def _load_quota():
-    f = _quota_file()
-    if f.exists():
+def _post(path, payload):
+    req = urllib.request.Request(
+        AUDIT_URL.rstrip("/") + path,
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=900) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
         try:
-            return json.loads(f.read_text())
+            return json.loads(e.read().decode())
         except Exception:
-            pass
-    return {}
-
-
-def _save_quota(q):
-    _quota_file().parent.mkdir(parents=True, exist_ok=True)
-    _quota_file().write_text(json.dumps(q, ensure_ascii=False, indent=2))
-
-
-def _now():
-    return int(time.time())
-
-
-def _check_access(email: str) -> dict:
-    """检查额度。返回 {"ok": bool, "reason": str}"""
-    if not email:
-        return {"ok": False, "reason": "请提供 email 参数（用于记录免费额度）"}
-    q = _load_quota()
-    rec = q.get(email, {})
-    now = _now()
-
-    if rec.get("license_until", 0) > now:
-        today = time.strftime("%Y-%m-%d")
-        month = time.strftime("%Y-%m")
-        if rec.get("daily_date") != today:
-            rec["daily_date"] = today
-            rec["daily_count"] = 0
-        if rec.get("daily_count", 0) >= DAILY_LIMIT:
-            q[email] = rec
-            _save_quota(q)
-            return {"ok": False, "reason": f"已达每日上限（{DAILY_LIMIT} 次/天）"}
-        if rec.get("monthly_month") != month:
-            rec["monthly_month"] = month
-            rec["monthly_count"] = 0
-        if rec.get("monthly_count", 0) >= MONTHLY_LIMIT:
-            q[email] = rec
-            _save_quota(q)
-            return {"ok": False, "reason": f"已达每月上限（{MONTHLY_LIMIT} 次/月）"}
-        rec["daily_count"] = rec.get("daily_count", 0) + 1
-        rec["monthly_count"] = rec.get("monthly_count", 0) + 1
-        q[email] = rec
-        _save_quota(q)
-        return {"ok": True, "reason": f"订阅中（今日 {rec['daily_count']}/{DAILY_LIMIT}）"}
-
-    if rec.get("count", 0) < FREE_LIMIT:
-        rec["count"] = rec.get("count", 0) + 1
-        q[email] = rec
-        _save_quota(q)
-        return {"ok": True, "reason": f"免费 {rec['count']}/{FREE_LIMIT}"}
-
-    return {"ok": False, "reason": f"免费额度已用尽（{FREE_LIMIT} 次）。订阅 {LICENSE_PRICE}：{BUY_LINK}"}
+            return {"ok": False, "error": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:120]}
 
 
 @mcp.tool()
-def check_license(license_key: str, email: str) -> dict:
-    """激活月度订阅 license（$98/月，每天 10 次、每月 100 次）。
+def audit_ai_visibility(url: str, api_key: str = "", license_key: str = "", email: str = "") -> dict:
+    """网站完整 AI 可见性审计（多模型 AI 提及 + GEO/SEO + 0-100 评分）。
 
-    Args:
-        license_key: license 密钥（以 "av-" 开头）。
-        email: 绑定 license 的邮箱。
-    """
-    if not license_key.startswith("av-"):
-        return {"ok": False, "message": "license 密钥无效"}
-    q = _load_quota()
-    rec = q.get(email, {})
-    rec["license_until"] = _now() + 30 * 86400
-    rec["daily_date"] = ""
-    rec["monthly_month"] = ""
-    q[email] = rec
-    _save_quota(q)
-    return {"ok": True, "message": f"订阅已激活 30 天（{DAILY_LIMIT} 次/天，{MONTHLY_LIMIT} 次/月）"}
-
-
-@mcp.tool()
-def audit_ai_visibility(url: str, email: str = "") -> dict:
-    """网站的完整 AI 可见性审计：多模型 AI 提及 + GEO/SEO 健康度 + 0–100 评分 + 基准分位。
-
-    同时问 ChatGPT（消费者版）、Perplexity、Grok 对品牌的真实认知，扫描网站技术健康度，
-    返回综合评分、基准分位和按优先级排序的问题清单。
+    薄壳转发：你的 api_key（或 license_key/email）会被转发到 GoAI Moat 服务器，
+    由服务器完成鉴权、配额判断与真实测评。所有密钥都在服务器端。
 
     Args:
         url: 网站地址（如 "https://example.com"）。
-        email: 你的邮箱（用于记录额度）。
+        api_key: 你的 GoAI Moat api_key（购买后用 check_license 激活获取）。
+        license_key: Gumroad license 密钥（api_key 的替代）。
+        email: 你的邮箱（用于免费 3 次试用）。
     """
-    access = _check_access(email)
-    if not access["ok"]:
-        return {"ok": False, "quota": access["reason"]}
-
-    url = url.strip().rstrip("/")
-    if not url.startswith("http"):
-        url = "https://" + url
-
-    checks = scan_site(url)
-    if not checks.get("accessible"):
-        return {"ok": False, "url": url, "error": "网站无法访问", "detail": checks.get("error")}
-
-    brand = infer_brand(checks)
-    probe = ai_probe(brand)
-    s = score_site(checks, probe)
-
-    return {
-        "ok": True,
-        "url": url,
-        "品牌": brand,
-        "综合评分": s["total"],
-        "seo评分": s["seo"],
-        "geo评分": s["geo"],
-        "基准分位": s["percentile"],
-        "AI提及": [
-            {"模型": p["model"], "角度": p["angle"], "是否提及": p["mentioned"], "回答": p["answer"]}
-            for p in probe
-        ],
-        "quota": access["reason"],
-    }
+    return _post("/api/audit", {
+        "url": url, "tier": "audit",
+        "api_key": api_key, "license_key": license_key, "email": email,
+    })
 
 
 @mcp.tool()
-def check_ai_mentions(brand: str, email: str = "") -> dict:
-    """快速查询：ChatGPT、Perplexity、Grok 对一个品牌的真实说法。
-
-    返回各模型的提及情况和回答，不包含完整网站扫描。
+def check_ai_mentions(brand: str, api_key: str = "", email: str = "") -> dict:
+    """快速查询：ChatGPT、Perplexity、Grok 对某品牌的真实说法。
 
     Args:
         brand: 品牌名（如 "RolePaths"）。
-        email: 你的邮箱（用于记录额度）。
+        api_key: 你的 GoAI Moat api_key（可选；email 免费试用亦可）。
+        email: 你的邮箱（用于免费试用）。
     """
-    access = _check_access(email)
-    if not access["ok"]:
-        return {"ok": False, "quota": access["reason"]}
+    return _post("/api/audit", {"brand": brand, "api_key": api_key, "email": email})
 
-    probe = ai_probe(brand.strip())
-    mentioned = [p["model"] for p in probe if p.get("mentioned")]
-    return {
-        "ok": True,
-        "品牌": brand.strip(),
-        "被提及的模型": mentioned,
-        "快照": [
-            {"模型": p["model"], "角度": p["angle"], "是否提及": p["mentioned"], "回答": p["answer"]}
-            for p in probe
-        ],
-        "quota": access["reason"],
-    }
+
+@mcp.tool()
+def check_license(license_key: str, email: str = "") -> dict:
+    """激活 Gumroad license，换取 GoAI Moat api_key。
+
+    Args:
+        license_key: 购买后获得的 Gumroad license 密钥。
+        email: 绑定 api_key 的邮箱。
+    """
+    return _post("/api/activate", {"license_key": license_key, "email": email})
 
 
 if __name__ == "__main__":
